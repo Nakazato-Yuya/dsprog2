@@ -7,6 +7,13 @@ import requests
 AREA_URL = "http://www.jma.go.jp/bosai/common/const/area.json"
 FORECAST_URL_BASE = "https://www.jma.go.jp/bosai/forecast/data/forecast/"
 
+# 【修正箇所1】例外的なURLの対応マップを追加
+# キー: 本来の地域コード -> 値: 実際にデータが入っている親ファイルのコード
+URL_EXCEPTIONS = {
+    "014030": "014100",  # 十勝地方 -> 釧路のファイル(014100.json)を見る
+    "460040": "460100",  # 奄美地方 -> 鹿児島のファイル(460100.json)を見る
+}
+
 # 天気の文字からアイコンと色を決める補助関数
 def get_weather_icon_info(text):
     if "晴" in text:
@@ -41,7 +48,7 @@ def main(page: ft.Page):
     # 2. 画面パーツ（枠組み）の作成
     # -------------------------------------------------------
     
-    # 右側：天気カードを並べるエリア（最初は空っぽ）
+    # 右側：天気カードを並べるエリア
     weather_grid = ft.GridView(
         expand=True,
         runs_count=5,           # 横に並べる最大数
@@ -65,8 +72,8 @@ def main(page: ft.Page):
         expand=True,
     )
 
-    # 左側：サイドバーの中身（最初は空っぽ）
-    sidebar_column = ft.Column(scroll=ft.ScrollMode.AUTO)
+    # 左側：サイドバーの中身（スクロール設定を強化）
+    sidebar_column = ft.Column(scroll=ft.ScrollMode.ALWAYS, expand=True)
     
     # 左側全体（背景色つき）
     sidebar = ft.Container(
@@ -83,7 +90,7 @@ def main(page: ft.Page):
     # 【機能A】選択された地域の天気を取得して表示する
     def display_weather(e):
         # ボタンから地域コードと名前を取り出す
-        code = e.control.data
+        target_code = e.control.data # 本来のコード (例: 014030)
         region_name = e.control.title.value
         
         # 画面をリセットして読み込み中にする
@@ -92,40 +99,60 @@ def main(page: ft.Page):
         page.update()
 
         try:
-            # APIからデータを取得
-            url = f"{FORECAST_URL_BASE}{code}.json"
+            # 【修正箇所2】URLの決定ロジック
+            # 例外マップにあれば親コードを、なければそのままのコードを使用
+            file_code = URL_EXCEPTIONS.get(target_code, target_code)
+            url = f"{FORECAST_URL_BASE}{file_code}.json"
+            
+            print(f"Fetching: {url} (Target: {target_code})") # ログ出力
+
             response = requests.get(url)
+            
+            if response.status_code != 200:
+                raise Exception(f"データ取得失敗: {response.status_code}")
+
             data = response.json()
 
             # --- JSON解析 ---
-            # data[0] -> timeSeries[0] (天気) -> areas[0] (該当地域) -> weathers (天気リスト)
             time_series = data[0]["timeSeries"][0]
             dates = time_series["timeDefines"]
             
-            # 地域コードが一致するエリアを探す
-            target_area = next((a for a in time_series["areas"] if a["area"]["code"] == code), time_series["areas"][0])
+            # 【修正箇所3】エリア検索ロジック
+            # ダウンロードしたファイルの中から、本来のコード(target_code)を持つエリアを探す
+            target_area = None
+            for area in time_series["areas"]:
+                if area["area"]["code"] == target_code:
+                    target_area = area
+                    break
+            
+            # 見つからなかった場合の保険（先頭のデータを表示）
+            if target_area is None:
+                target_area = time_series["areas"][0]
+
             weathers = target_area["weathers"]
 
             # 気温データの取得（エラー回避のためtry使用）
             temps_min, temps_max = [], []
             try:
-                temp_area = data[0]["timeSeries"][1]["areas"][0]
+                # 気温情報は timeSeries[1] にあることが多いが、エリア構成が違う場合があるので簡易処理
+                temp_series = data[0]["timeSeries"][1]
+                temp_area = temp_series["areas"][0] # 簡易的に最初の地点の気温を取得
                 temps_min = temp_area.get("tempsMin", [])
                 temps_max = temp_area.get("tempsMax", [])
             except:
-                pass # 気温が取れなくても無視して進む
+                pass 
 
             # 準備完了：メッセージを消す
             message_area.content = ft.Container()
             
             # 日付と天気を組み合わせてカードを作る
             for i, (date_str, weather_text) in enumerate(zip(dates, weathers)):
-                date_val = date_str[:10] # 日付だけ切り出し
+                date_val = date_str[:10] 
                 icon, icon_color = get_weather_icon_info(weather_text)
                 
-                # 気温テキスト（データがある場合のみ表示）
-                min_t = temps_min[i] if i < len(temps_min) and temps_min[i] != "" else "-"
-                max_t = temps_max[i] if i < len(temps_max) and temps_max[i] != "" else "-"
+                # 気温テキスト
+                min_t = temps_min[i] if i < len(temps_min) and temps_min[i] is not None else "-"
+                max_t = temps_max[i] if i < len(temps_max) and temps_max[i] is not None else "-"
                 
                 # カードの中身を作成
                 card = ft.Container(
@@ -154,6 +181,8 @@ def main(page: ft.Page):
                 weather_grid.controls.append(card)
 
         except Exception as err:
+            import traceback
+            traceback.print_exc()
             message_area.content = ft.Text(f"エラーが発生しました: {err}", color=ft.Colors.RED)
         
         page.update()
@@ -164,30 +193,25 @@ def main(page: ft.Page):
             response = requests.get(AREA_URL)
             data = response.json()
             
-            # サイドバーの見出し
             sidebar_items = [
                 ft.Text("地域を選択", color=ft.Colors.WHITE, weight="bold"),
                 ft.Divider(color=ft.Colors.GREY_600)
             ]
 
-            # 地方ごとにループ
             for center in data["centers"].values():
                 children_codes = center["children"]
                 pref_tiles = []
                 
-                # 都道府県ごとにループ
                 for code in children_codes:
                     if code in data["offices"]:
                         office = data["offices"][code]
-                        # ボタンを作成（ここにコードを隠し持つ）
                         tile = ft.ListTile(
                             title=ft.Text(office["name"], color=ft.Colors.GREY_300, size=13),
-                            data=code, # 重要：クリック時にこれを使う
+                            data=code, 
                             on_click=display_weather
                         )
                         pref_tiles.append(tile)
                 
-                # 折りたたみメニューに追加
                 if pref_tiles:
                     sidebar_items.append(
                         ft.ExpansionTile(
@@ -208,7 +232,6 @@ def main(page: ft.Page):
     # -------------------------------------------------------
     # 4. 画面の組み立てと起動
     # -------------------------------------------------------
-    # 左（サイドバー）と右（メイン）を横並びにする
     page.add(
         ft.Row(
             [sidebar, main_content],
@@ -217,7 +240,6 @@ def main(page: ft.Page):
         )
     )
 
-    # 最後にリスト読み込みを実行
     load_area_list()
 
 ft.app(target=main)
